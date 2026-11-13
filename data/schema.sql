@@ -1,0 +1,3 @@
+-- Add your SQLite table definitions here.
+-- Suggested entities: users, sports_preferences, partner_posts,
+-- venues, venue_recommendations, and audit_events.
