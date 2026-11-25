@@ -1,5 +1,5 @@
-
 import flet as ft
+from database import authenticate_user
 
 # =====================================
 # KAWATCAMSUR COLORS
@@ -12,22 +12,107 @@ TEAL = "#14B8A6"
 WHITE = "#F8FAFC"
 MUTED = "#94A3B8"
 BORDER = "#55FFFFFF"
+ERROR = "#F87171"
 
 
 # =====================================
 # LOGIN PAGE
 # =====================================
 
-def build(on_signup=None):
+def build(on_signup=None, on_success=None):
+    """Login screen.
+
+    on_signup  - called when "Sign Up" is clicked (your teammate's navigation).
+    on_success - called with the user dict after a valid login, e.g. to open
+                 the dashboard. If not given, a welcome message is shown.
+    """
+
+    # =================================
+    # INPUT FIELDS
+    # =================================
+
+    email_field = ft.TextField(
+        hint_text="name@example.com",
+        prefix_icon=ft.Icons.EMAIL_OUTLINED,
+        keyboard_type=ft.KeyboardType.EMAIL,
+        bgcolor=INPUT_BG,
+        color=WHITE,
+        border_color=BORDER,
+        focused_border_color=TEAL,
+        border_radius=9,
+    )
+
+    password_field = ft.TextField(
+        hint_text="Enter your password",
+        prefix_icon=ft.Icons.LOCK_OUTLINE,
+        password=True,
+        can_reveal_password=True,
+        bgcolor=INPUT_BG,
+        color=WHITE,
+        border_color=BORDER,
+        focused_border_color=TEAL,
+        border_radius=9,
+    )
+
+    error_text = ft.Text(
+        "",
+        color=ERROR,
+        size=12,
+        visible=False,
+        text_align=ft.TextAlign.CENTER,
+    )
+
+    # =================================
+    # ACTIONS
+    # =================================
+
+    def show_error(message):
+        error_text.value = message
+        error_text.visible = True
+        error_text.update()
 
     def show_message(e):
-        e.control.page.open(
+        e.control.page.show_dialog(
             ft.SnackBar(
                 content=ft.Text(
                     "This feature will be connected later."
                 )
             )
         )
+
+    def do_login(e):
+        page = e.control.page
+
+        email = (email_field.value or "").strip()
+        password = password_field.value or ""
+
+        if not email or not password:
+            show_error("Enter your email and password.")
+            return
+
+        # checks the password and saves the login record in audit_events
+        user = authenticate_user(email, password)
+
+        if user is None:
+            show_error("Invalid email or password.")
+            return
+
+        error_text.visible = False
+        error_text.update()
+
+        # keep the logged-in user so other pages can use it
+        page.data = {"user": user}
+
+        if on_success:
+            on_success(user)
+        else:
+            page.show_dialog(
+                ft.SnackBar(
+                    content=ft.Text(f"Welcome, {user['full_name']}!")
+                )
+            )
+
+    password_field.on_submit = do_login
 
     # =================================
     # GLASS LOGIN CARD
@@ -100,16 +185,7 @@ def build(on_signup=None):
                             color=WHITE,
                             size=13,
                         ),
-                        ft.TextField(
-                            hint_text="name@example.com",
-                            prefix_icon=ft.Icons.EMAIL_OUTLINED,
-                            keyboard_type=ft.KeyboardType.EMAIL,
-                            bgcolor=INPUT_BG,
-                            color=WHITE,
-                            border_color=BORDER,
-                            focused_border_color=TEAL,
-                            border_radius=9,
-                        ),
+                        email_field,
                     ],
                 ),
 
@@ -122,19 +198,12 @@ def build(on_signup=None):
                             color=WHITE,
                             size=13,
                         ),
-                        ft.TextField(
-                            hint_text="Enter your password",
-                            prefix_icon=ft.Icons.LOCK_OUTLINE,
-                            password=True,
-                            can_reveal_password=True,
-                            bgcolor=INPUT_BG,
-                            color=WHITE,
-                            border_color=BORDER,
-                            focused_border_color=TEAL,
-                            border_radius=9,
-                        ),
+                        password_field,
                     ],
                 ),
+
+                # ERROR MESSAGE (hidden until a login fails)
+                error_text,
 
                 # SIGN IN BUTTON
                 ft.Button(
@@ -143,7 +212,7 @@ def build(on_signup=None):
                     width=float("inf"),
                     bgcolor=TEAL,
                     color=WHITE,
-                    on_click=show_message,
+                    on_click=do_login,
                     style=ft.ButtonStyle(
                         shape=ft.RoundedRectangleBorder(
                             radius=10,

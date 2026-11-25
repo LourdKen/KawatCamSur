@@ -28,6 +28,18 @@ DEFAULT_SPORTS = [
 
 PBKDF2_ITERATIONS = 200_000
 
+# Role-based access control: which actions each role may do.
+# New signups always get the 'user' role.
+ROLE_PERMISSIONS = {
+    "user": {
+        "add_venue", "add_review", "create_post", "join_post",
+    },
+    "admin": {
+        "add_venue", "add_review", "create_post", "join_post",
+        "approve_venue", "manage_users", "view_audit_log",
+    },
+}
+
 
 # -----------------------------------------------------
 # Connection and setup
@@ -89,6 +101,97 @@ def log_event(action, user_id=None, entity_type=None, entity_id=None, details=No
             "VALUES (?, ?, ?, ?, ?)",
             (user_id, action, entity_type, entity_id, details),
         )
+
+
+# -----------------------------------------------------
+# Role-based access control (RBAC)
+# -----------------------------------------------------
+def get_role(user_id):
+    """Role of a user, read from the database (so a page cannot fake it)."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT role FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    return row["role"] if row else None
+
+
+def has_permission(user_id, permission) -> bool:
+    return permission in ROLE_PERMISSIONS.get(get_role(user_id), set())
+
+
+def require_permission(user_id, permission) -> None:
+    """Raise PermissionError (and log it) if the user may not do this."""
+    role = get_role(user_id)
+    if permission not in ROLE_PERMISSIONS.get(role, set()):
+        # an unknown user id cannot be stored as a foreign key, so log it as NULL
+        log_event(
+            "permission_denied",
+            user_id if role else None,
+            details=permission if role else f"{permission} (unknown user id {user_id})",
+        )
+        raise PermissionError("You don't have permission to do that.")
+
+
+def make_first_admin(email) -> None:
+    """One-time setup. Works only while there is no admin yet."""
+    with get_connection() as conn:
+        if conn.execute("SELECT 1 FROM users WHERE role = 'admin'").fetchone():
+            raise ValueError("An admin already exists.")
+        cur = conn.execute(
+            "UPDATE users SET role = 'admin' WHERE email = ?", (email.strip().lower(),)
+        )
+        if cur.rowcount == 0:
+            raise ValueError("No user with that email. Sign up first.")
+        user_id = conn.execute(
+            "SELECT user_id FROM users WHERE email = ?", (email.strip().lower(),)
+        ).fetchone()["user_id"]
+    log_event("first_admin_created", user_id, "user", user_id)
+
+
+def set_user_role(acting_user_id, target_user_id, new_role) -> None:
+    """Admins only. The last remaining admin cannot be demoted."""
+    require_permission(acting_user_id, "manage_users")
+    if new_role not in ROLE_PERMISSIONS:
+        raise ValueError("Unknown role.")
+    with get_connection() as conn:
+        target = conn.execute(
+            "SELECT role FROM users WHERE user_id = ?", (target_user_id,)
+        ).fetchone()
+        if not target:
+            raise ValueError("User not found.")
+        if target["role"] == "admin" and new_role != "admin":
+            admins = conn.execute(
+                "SELECT COUNT(*) FROM users WHERE role = 'admin'"
+            ).fetchone()[0]
+            if admins <= 1:
+                raise ValueError("You cannot remove the last admin.")
+        conn.execute(
+            "UPDATE users SET role = ? WHERE user_id = ?", (new_role, target_user_id)
+        )
+    log_event("role_changed", acting_user_id, "user", target_user_id, new_role)
+
+
+def list_users(acting_user_id):
+    """Admins only."""
+    require_permission(acting_user_id, "manage_users")
+    with get_connection() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT user_id, username, email, full_name, role, created_at "
+            "FROM users ORDER BY created_at DESC"
+        )]
+
+
+def get_login_records(acting_user_id, limit=50):
+    """Admins only. Saved login and signup attempts, newest first."""
+    require_permission(acting_user_id, "view_audit_log")
+    with get_connection() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT e.event_id, e.action, e.created_at, e.details, u.username, u.email "
+            "FROM audit_events e LEFT JOIN users u ON u.user_id = e.user_id "
+            "WHERE e.action IN ('register', 'login', 'login_failed') "
+            "ORDER BY e.event_id DESC LIMIT ?",
+            (limit,),
+        )]
 
 
 # -----------------------------------------------------
@@ -175,6 +278,7 @@ def get_user_sports(user_id):
 def add_venue(name, added_by, sport_ids, address=None, municipality=None,
               latitude=None, longitude=None, venue_type=None) -> int:
     """Submit a venue (starts as 'pending' until an admin approves it)."""
+    require_permission(added_by, "add_venue")
     with get_connection() as conn:
         cur = conn.execute(
             "INSERT INTO venues (name, address, municipality, latitude, longitude, "
@@ -191,10 +295,19 @@ def add_venue(name, added_by, sport_ids, address=None, municipality=None,
 
 
 def set_venue_status(venue_id, status, admin_id) -> None:
-    """Approve or reject a venue ('approved' / 'rejected')."""
+    """Approve or reject a venue ('approved' / 'rejected'). Admins only."""
+    require_permission(admin_id, "approve_venue")
+    if status not in ("pending", "approved", "rejected"):
+        raise ValueError("Invalid venue status.")
     with get_connection() as conn:
         conn.execute("UPDATE venues SET status = ? WHERE venue_id = ?", (status, venue_id))
     log_event(f"venue_{status}", admin_id, "venue", venue_id)
+
+
+def list_pending_venues(admin_id):
+    """Admins only: venues waiting for approval."""
+    require_permission(admin_id, "approve_venue")
+    return list_venues(status="pending")
 
 
 def list_venues(sport_id=None, municipality=None, status="approved"):
@@ -223,6 +336,7 @@ def list_venues(sport_id=None, municipality=None, status="approved"):
 
 def add_recommendation(venue_id, user_id, rating, comment=None) -> None:
     """Rate/review a venue. One review per user per venue (a new one replaces the old)."""
+    require_permission(user_id, "add_review")
     with get_connection() as conn:
         conn.execute(
             "INSERT INTO venue_recommendations (venue_id, user_id, rating, comment) "
@@ -250,6 +364,7 @@ def get_recommendations(venue_id):
 def create_partner_post(requester_id, sport_id, scheduled_at, venue_id=None,
                         skill_level_wanted="any", slots_needed=1, description=None) -> int:
     """scheduled_at format: 'YYYY-MM-DD HH:MM'."""
+    require_permission(requester_id, "create_post")
     with get_connection() as conn:
         cur = conn.execute(
             "INSERT INTO partner_posts (requester_id, sport_id, venue_id, scheduled_at, "
@@ -284,6 +399,7 @@ def list_open_posts(sport_id=None):
 
 def join_partner_post(post_id, user_id) -> None:
     """Ask to join a post. Raises ValueError if it's your own post or already requested."""
+    require_permission(user_id, "join_post")
     with get_connection() as conn:
         post = conn.execute(
             "SELECT requester_id, status FROM partner_posts WHERE post_id = ?", (post_id,)
